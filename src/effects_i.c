@@ -20,6 +20,7 @@
 
 #define LSX_EFF_ALIAS
 #include "sox_i.h"
+#include "unicode_support.h"
 #include <string.h>
 #include <ctype.h>
 
@@ -463,7 +464,7 @@ FILE * lsx_open_input_file(sox_effect_t * effp, char const * filename, sox_bool 
     effp->global_info->global_info->stdin_in_use_by = effp->handler.name;
     file = stdin;
   }
-  else if (!(file = fopen(filename, text_mode ? "r" : "rb"))) {
+  else if (!(file = lsx_fopen(filename, text_mode ? "r" : "rb"))) {
     lsx_fail("couldn't open file %s: %s", filename, strerror(errno));
     return NULL;
   }

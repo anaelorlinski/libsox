@@ -21,10 +21,12 @@
   #define HAVE_TWOLAME 1
 #endif
 
-#if defined(HAVE_MAD_H) || defined(HAVE_LAME) || defined(HAVE_TWOLAME)
+#if defined(HAVE_MAD_H) || defined(HAVE_MPG123_H) || defined(HAVE_LAME) || defined(HAVE_TWOLAME)
 
 #ifdef HAVE_MAD_H
 #include <mad.h>
+#elif HAVE_MPG123_H
+#include <mpg123.h>
 #endif
 
 #if defined(HAVE_LAME_LAME_H)
@@ -114,6 +116,41 @@ static const char* const mad_library_names[] =
   MAD_FUNC(f,x, void, mad_header_init, (struct mad_header *)) \
   MAD_FUNC(f,x, signed long, mad_timer_count, (mad_timer_t, enum mad_units)) \
   MAD_FUNC(f,x, void, mad_timer_multiply, (mad_timer_t *, signed long))
+static const char* const mpg123_library_names[] =
+{
+#ifdef DL_MPG123
+    "libmpg123",
+    "libmpg123-0",
+    "cygmpg123-0",
+#endif
+    NULL
+};
+
+#ifdef DL_MPG123
+  #define MPG123_FUNC LSX_DLENTRY_DYNAMIC
+#else
+  #define MPG123_FUNC LSX_DLENTRY_STATIC
+#endif
+
+#define MPG123_FUNC_ENTRIES(f,x) \
+    MPG123_FUNC(f,x, int, mpg123_init, (void)) \
+    MPG123_FUNC(f,x, void, mpg123_exit, (void)) \
+    MPG123_FUNC(f,x, mpg123_handle *,mpg123_new,(const char*, int)) \
+    MPG123_FUNC(f,x, int, mpg123_param,(mpg123_handle *, enum mpg123_parms, long , double)) \
+    MPG123_FUNC(f,x, int, mpg123_format_none,(mpg123_handle *)) \
+    MPG123_FUNC(f,x, int, mpg123_open_feed,(mpg123_handle *)) \
+    MPG123_FUNC(f,x, int, mpg123_feed, (mpg123_handle *mh, const unsigned char *, size_t)) \
+    MPG123_FUNC(f,x, int, mpg123_format,(mpg123_handle *, long, int, int)) \
+    MPG123_FUNC(f,x, off_t, mpg123_feedseek,(mpg123_handle *, off_t , int , off_t *)) \
+    MPG123_FUNC(f,x, const char*, mpg123_strerror,(mpg123_handle *)) \
+    MPG123_FUNC(f,x, void, mpg123_rates, (const long **, size_t *)) \
+    MPG123_FUNC(f,x, int, mpg123_set_filesize,(mpg123_handle *, off_t )) \
+    MPG123_FUNC(f,x, off_t, mpg123_length, (mpg123_handle *)) \
+    MPG123_FUNC(f,x, int,mpg123_read, (mpg123_handle *, unsigned char *, size_t , size_t *)) \
+    MPG123_FUNC(f,x, int,mpg123_close,(mpg123_handle *)) \
+    MPG123_FUNC(f,x, const char*, mpg123_plain_strerror,(int ))
+
+// ---------------------------------------------------------------------------------------------
 
 static const char* const lame_library_names[] =
 {
@@ -207,7 +244,10 @@ typedef struct mp3_priv_t {
   ptrdiff_t               cursamp;
   size_t                  FrameCount;
   LSX_DLENTRIES_TO_PTRS(MAD_FUNC_ENTRIES, mad_dl);
-#endif /*HAVE_MAD_H*/
+#elif HAVE_MPG123_H
+  mpg123_handle* mpg123handle;
+  LSX_DLENTRIES_TO_PTRS(MPG123_FUNC_ENTRIES, mpg123_dl);
+#endif
 
 #if defined(HAVE_LAME) || defined(HAVE_TWOLAME)
   float *pcm_buffer;
@@ -662,7 +702,275 @@ static int sox_mp3seek(sox_format_t * ft, uint64_t offset)
 
   return SOX_EOF;
 }
-#else /* !HAVE_MAD_H */
+#elif HAVE_MPG123_H
+/* -----------------------------------------MPG123 ----------------------------------- */
+
+// feed data until stream start is found
+static int sox_initial_seek(sox_format_t * ft)
+{
+    int feed_ret;
+    off_t seek_ret;
+    priv_t *p=(priv_t*) ft->priv;
+
+    off_t stream_offset = 0;
+    off_t read_len;
+
+    // go to sample 0 to skip tags and find stream data.
+    // run feedseek/feed until wanted position is reached
+    while((seek_ret = p->mpg123_feedseek(p->mpg123handle, 0, SEEK_SET, &stream_offset)) == MPG123_NEED_MORE)
+    {
+        read_len = lsx_readbuf(ft, p->mp3_buffer, p->mp3_buffer_size);
+        if (read_len != (off_t)p->mp3_buffer_size && lsx_error(ft))
+        {
+            lsx_debug("sox_initial_seek readbuf failed");
+            return SOX_EOF;
+        }
+
+        // in case we never find mp3 frame data...
+        if(read_len <= 0)
+        {
+            lsx_debug("sox_initial_seek read_len < 0");
+            return SOX_EOF;
+        }
+
+        feed_ret = p->mpg123_feed(p->mpg123handle, p->mp3_buffer, read_len);
+        if(feed_ret == MPG123_ERR)
+        {
+            lsx_debug("sox_initial_seek Error: %s", p->mpg123_strerror(p->mpg123handle));
+            return SOX_EOF;
+        }
+    }
+    if(seek_ret == MPG123_ERR)
+    {
+        lsx_debug("sox_initial_seek feedseek failed: %s\n", p->mpg123_strerror(p->mpg123handle));
+        return SOX_EOF;
+    }
+    return SOX_SUCCESS;
+}
+
+static int sox_mp3seek(sox_format_t * ft, uint64_t offset)
+{
+    off_t seek_ret, stream_offset = 0;
+    priv_t *p=(priv_t*) ft->priv;
+
+    // need to check in case of channels is incorrect
+    if (ft->signal.channels == 0)
+    {
+        lsx_debug("sox_mp3seek wrong chanels");
+        return SOX_EOF;
+    }
+
+    // run in feed mode, then use feedseek to ask for seek position
+    seek_ret = p->mpg123_feedseek(p->mpg123handle, offset / ft->signal.channels, SEEK_SET, &stream_offset);
+    if (seek_ret < 0)
+    {
+        lsx_debug("sox_mp3seek feedseek failed");
+        return SOX_EOF;
+    }
+
+    // then seek to the required offset
+    return lsx_seeki(ft, stream_offset, SEEK_SET);
+}
+
+
+
+static int startread(sox_format_t * ft)
+{
+  priv_t *p = (priv_t *) ft->priv;
+
+  sox_bool ignore_length = ft->signal.length == SOX_IGNORE_LENGTH;
+
+  int open_library_result;
+
+  LSX_DLLIBRARY_OPEN(
+      p,
+      mpg123_dl,
+      MPG123_FUNC_ENTRIES,
+      "MPG123 decoder library",
+      mpg123_library_names,
+      open_library_result);
+  if (open_library_result)
+    return SOX_EOF;
+
+  // warning not treadsafe...
+  p->mpg123_init();
+
+  p->mp3_buffer_size = sox_globals.bufsiz;
+  p->mp3_buffer = lsx_malloc(p->mp3_buffer_size);
+
+  ft->signal.length = SOX_UNSPEC;
+
+  // init mpg123 stream
+  int ret;
+  p->mpg123handle = mpg123_new(NULL, &ret);
+  p->mpg123_param(p->mpg123handle, MPG123_VERBOSE, 10, 0);
+
+  ret = p->mpg123_param(p->mpg123handle, MPG123_FLAGS, MPG123_FUZZY | MPG123_SEEKBUFFER, 0);
+  if(ret != MPG123_OK)
+  {
+      lsx_debug("mpg123_param 1 failed");
+      return SOX_EOF;
+  }
+
+  ret = p->mpg123_param(p->mpg123handle, MPG123_INDEX_SIZE, -1, 0);
+  if(ret != MPG123_OK)
+  {
+      lsx_debug("mpg123_param 2 failed");
+      return SOX_EOF;
+  }
+
+  // cleanup all the output formats
+  ret = p->mpg123_format_none(p->mpg123handle);
+  if(ret != MPG123_OK)
+  {
+      lsx_debug("Unable to disable all output formats: %s\n", p->mpg123_plain_strerror(ret));
+      return SOX_EOF;
+  }
+
+  // all the sample rates offered by libmpg123 are available, so get them from the decoder and allow them
+  // with either 1 or 2 channels. the required output is ENC_SIGNED_32 for every one because SoX likes it.
+  const long* avail_rates;
+  size_t avail_rates_size;
+  p->mpg123_rates(&avail_rates, &avail_rates_size);
+  size_t r=0;
+  for(; r<avail_rates_size; r++)
+  {
+      ret = p->mpg123_format(p->mpg123handle, avail_rates[r], MPG123_MONO | MPG123_STEREO,  MPG123_ENC_SIGNED_32);
+      if(ret != MPG123_OK)
+      {
+         lsx_debug("Unable to set float output formats: %s\n", p->mpg123_plain_strerror(ret));
+          return SOX_EOF;
+      }
+  }
+  ft->signal.precision = 32; // because of MPG123_ENC_SIGNED_32
+
+  // open the feed
+  ret = p->mpg123_open_feed(p->mpg123handle);
+  if(ret != MPG123_OK)
+  {
+      lsx_debug("Unable open feed: %s\n", p->mpg123_plain_strerror(ret));
+      return SOX_EOF;
+  }
+
+  // skip tags and to to first mp3 data
+  ret = sox_initial_seek(ft);
+  if (ret != SOX_SUCCESS)
+  {
+      lsx_debug("startread sox_initial_seek failed");
+      return SOX_EOF;
+  }
+
+  ft->encoding.encoding = SOX_ENCODING_MP3;
+
+  // get file info
+  long rate;
+  int channels, enc;
+  mpg123_getformat(p->mpg123handle, &rate, &channels, &enc);
+
+  ft->signal.channels = channels;
+  ft->signal.rate = rate;
+
+  // in case this is a real file we can retrieve the length
+  // returns 0 in case of failure
+  off_t file_length = lsx_filelength(ft);
+  if (file_length != 0)
+  {
+      // since we use mpg123 in stream mode we need to set the filesize
+      // so the length calculation has better accuracy
+      ret = p->mpg123_set_filesize(p->mpg123handle, file_length);
+      if(ret == MPG123_OK)
+      {
+          // set the file size succeed, so now the length can be guessed
+          if (!ignore_length)
+          {
+              // retrieve the file length
+              off_t samples_length = p->mpg123_length(p->mpg123handle);
+              if (samples_length != MPG123_ERR)
+              {
+                  ft->signal.length = samples_length * channels;
+              }
+          }
+      }
+  }
+
+  lsx_debug("sox mp3 startread startread done\n");
+
+  return SOX_SUCCESS;
+}
+
+/*
+ * read the data and fill the buffer
+ */
+static size_t sox_mp3read(sox_format_t * ft, sox_sample_t *buf, size_t len)
+{
+    priv_t *p = (priv_t *) ft->priv;
+
+    size_t avail_bytes = 0;
+    size_t read_len;
+    int read_ret, feed_ret;
+
+    while ((read_ret = p->mpg123_read(p->mpg123handle, (unsigned char*)buf, len * sizeof(sox_sample_t), &avail_bytes )) != MPG123_OK)
+    {
+        if (read_ret == MPG123_NEED_MORE)
+        {
+            // read data from input
+            read_len = lsx_readbuf(ft, p->mp3_buffer, p->mp3_buffer_size);
+            if (read_len != p->mp3_buffer_size && lsx_error(ft))
+            {
+                // need more and got some random error... fail
+                lsx_debug("sox_mp3read read error");
+                return 0;
+            }
+
+            // if no data left cannot continue!
+            if(read_len <= 0)
+            {
+                break;
+            }
+
+            // push into mp3 decoder
+            feed_ret = p->mpg123_feed(p->mpg123handle, p->mp3_buffer, read_len);
+            if(feed_ret == MPG123_ERR)
+            {
+                lsx_debug("sox_mp3read mpg123_feed error");
+                return 0;
+            }
+            else if (feed_ret != MPG123_OK)
+            {
+                lsx_debug("sox_mp3read unhandled FEED result=%d", feed_ret);
+            }
+
+            // there is data to return already
+            if (avail_bytes > 0)
+            {
+                break;
+            }
+        }
+        else if (read_ret == MPG123_DONE)
+        {
+            break;
+        }
+    }
+
+    return (avail_bytes / sizeof(sox_sample_t));
+}
+
+static int stopread(sox_format_t * ft)
+{
+  priv_t *p=(priv_t*) ft->priv;
+
+  p->mpg123_close(p->mpg123handle);
+  free(p->mp3_buffer);
+
+  LSX_DLLIBRARY_CLOSE(p, mpg123_dl);
+  return SOX_SUCCESS;
+}
+
+
+
+/* -------------------------------------------- MPG123 end ---------------------------------------- */
+
+#else /* !HAVE_MAD_H && !HAVE_MPG123_H */
 static int startread(sox_format_t * ft)
 {
   lsx_fail_errno(ft,SOX_EOF,"SoX was compiled without MP3 decoding support");

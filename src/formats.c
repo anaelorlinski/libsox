@@ -20,6 +20,7 @@
 
 #define _GNU_SOURCE
 #include "sox_i.h"
+#include "unicode_support.h"
 
 #include <assert.h>
 #include <ctype.h>
@@ -94,6 +95,9 @@ static char const * auto_detect_format(sox_format_t * ft, char const * ext)
   CHECK(sox   , 0, 0, ""     , 0,  4, ".SoX")
   CHECK(sox   , 0, 0, ""     , 0,  4, "XoS.")
 
+  // AO minimal m4a support. maybe need more
+  CHECK(m4a  , 0, 0, "" , 4,  7, "ftypM4A")
+
   if (ext && !strcasecmp(ext, "snd"))
   CHECK(sndr  , 7, 1, ""     , 0,  2, "\0")
   #undef CHECK
@@ -150,6 +154,7 @@ static sox_encodings_info_t const s_sox_encodings_info[] = {
   {sox_encodings_lossy2, "CVSD"         , "CVSD"},
   {sox_encodings_lossy2, "LPC10"        , "LPC10"},
   {sox_encodings_lossy2, "Opus"         , "Opus"},
+  {sox_encodings_lossy2, "AAC audio"    , "AAC audio"},
 };
 
 assert_static(array_length(s_sox_encodings_info) == SOX_ENCODINGS,
@@ -187,6 +192,8 @@ unsigned sox_precision(sox_encoding_t encoding, unsigned bits_per_sample)
     case SOX_ENCODING_DPCM:       return bits_per_sample; /* ? */
 
     case SOX_ENCODING_MP3:        return 0; /* Accept the precision returned by the format. */
+    // TODO AO
+    case SOX_ENCODING_AAC:        return 0; /* Accept the precision returned by the format. */
 
     case SOX_ENCODING_GSM:
     case SOX_ENCODING_VORBIS:
@@ -450,7 +457,7 @@ static FILE * xfopen(char const * identifier, char const * mode, lsx_io_type * i
 #endif
     return f;
   }
-  return fopen(identifier, mode);
+  return lsx_fopen(identifier, mode);
 }
 
 /* Hack to rewind pipes (a small amount).
@@ -904,8 +911,8 @@ static sox_format_t * open_write(
       ft->fp = stdout;
     }
     else {
-      struct stat st;
-      if (!stat(path, &st) && (st.st_mode & S_IFMT) == S_IFREG &&
+      lsx_stat_t st;
+      if (!lsx_stat(path, &st) && (st.st_mode & S_IFMT) == S_IFREG &&
           (overwrite_permitted && !overwrite_permitted(path))) {
         lsx_fail("permission to overwrite `%s' denied", path);
         goto error;
@@ -915,7 +922,7 @@ static sox_format_t * open_write(
         buffer? fmemopen(buffer, buffer_size, "w+b") :
         buffer_ptr? open_memstream(buffer_ptr, buffer_size_ptr) :
 #endif
-        fopen(path, "w+b");
+        lsx_fopen(path, "w+b");
       if (ft->fp == NULL) {
         lsx_fail("can't open output file `%s': %s", path, strerror(errno));
         goto error;
